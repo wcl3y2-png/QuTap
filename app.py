@@ -16,14 +16,34 @@ except FileNotFoundError:
 
 # --- 1. DATA FETCHING ---
 def get_company_data(ticker):
+    # 1. TEST THE KEY FIRST
+    if not API_KEY:
+        st.error("CRITICAL ERROR: API_KEY is empty. Check your secrets.toml file.")
+        return None
+
     try:
-        # Fetch Profile, Metrics, and Cash Flow
-        profile_req = requests.get(f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={API_KEY}")
+        # 2. DEBUG MODE: Print the URL (masked) to ensure it looks right
+        url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={API_KEY}"
+        # st.write(f"Testing URL: {url.replace(API_KEY, 'HIDDEN_KEY')}") # Uncomment to see the URL structure
+        
+        profile_req = requests.get(url)
+        
+        # 3. CATCH HTTP ERRORS (401, 403, 404)
+        if profile_req.status_code != 200:
+            st.error(f"API Error: {profile_req.status_code}")
+            st.error(f"FMP Message: {profile_req.text}") # <--- THIS IS THE KEY
+            return None
+        
+        # If profile works, try the others
         metrics_req = requests.get(f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{ticker}?apikey={API_KEY}")
         cf_req = requests.get(f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{ticker}?limit=1&apikey={API_KEY}")
-        
-        if profile_req.status_code != 200: return None
-        
+
+        # Check for specific endpoint failures
+        if metrics_req.status_code != 200:
+            st.warning(f"Metrics Endpoint Failed: {metrics_req.text}")
+        if cf_req.status_code != 200:
+            st.warning(f"Cash Flow Endpoint Failed: {cf_req.text}")
+
         profile = profile_req.json()[0]
         metrics = metrics_req.json()[0]
         cf = cf_req.json()[0]
@@ -38,7 +58,8 @@ def get_company_data(ticker):
             "fcf": cf['freeCashFlow'],
             "beta": profile['beta']
         }
-    except Exception:
+    except Exception as e:
+        st.error(f"Python Error: {str(e)}")
         return None
 
 # --- 2. DCF LOGIC ---

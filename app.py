@@ -1,87 +1,74 @@
 import streamlit as st
-import requests
+import yfinance as yf
 import pandas as pd
 import numpy_financial as npf
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="DCF Master", layout="wide")
 
-# --- API SETUP ---
-try:
-    API_KEY = st.secrets["FMP_API_KEY"]
-except FileNotFoundError:
-    st.error("API Key not found. Please set FMP_API_KEY in secrets.")
-    st.stop()
-
-# --- 1. DATA FETCHING (FREE TIER COMPATIBLE) ---
+# --- 1. DATA FETCHING (VIA YAHOO FINANCE) ---
 def get_company_data(ticker):
-    if not API_KEY: return None
-    
     try:
-        # 1. Get Quote (Price, Name, Shares) - usually robust on free tier
-        quote_url = f"https://financialmodelingprep.com/api/v3/quote/{ticker}?apikey={API_KEY}"
-        quote_req = requests.get(quote_url)
+        stock = yf.Ticker(ticker)
+        info = stock.info
         
-        # 2. Get Balance Sheet (For Net Debt) - Standard Annual
-        bs_url = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{ticker}?period=annual&limit=1&apikey={API_KEY}"
-        bs_req = requests.get(bs_url)
-        
-        # 3. Get Cash Flow (For FCF) - Standard Annual
-        cf_url = f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{ticker}?period=annual&limit=1&apikey={API_KEY}"
-        cf_req = requests.get(cf_url)
-
-        # ERROR HANDLING
-        if quote_req.status_code != 200:
-            st.error(f"Quote API Error: {quote_req.text}")
+        # Check if data exists
+        if 'currentPrice' not in info:
+            st.error(f"Could not fetch data for {ticker}. Is the symbol correct?")
             return None
+
+        # 1. PRICE & SHARES
+        price = info.get('currentPrice', 0)
+        shares = info.get('sharesOutstanding', 0)
+        name = info.get('longName', ticker)
+        
+        # 2. FINANCIAL STATEMENTS (DataFrame format)
+        # We use .iloc[:, 0] to get the most recent column (latest year)
+        bs = stock.balance_sheet
+        cf = stock.cashflow
+        
+        if bs.empty or cf.empty:
+            st.warning("Financial statements not found. Using partial data.")
+            return None
+
+        # 3. CALCULATE NET DEBT
+        # Try different naming conventions Yahoo uses
+        try:
+            total_debt = bs.loc['Total Debt'].iloc[0]
+        except KeyError:
+            # Fallback if specific line item is missing
+            total_debt = 0
             
-        quote_data = quote_req.json()
-        if not quote_data:
-            st.error("Ticker not found.")
-            return None
-        quote = quote_data[0]
-        
-        # If statements are empty (e.g. ETFs or new listings), handle gracefully
-        bs_data = bs_req.json()
-        cf_data = cf_req.json()
-        
-        if not bs_data or not cf_data:
-            st.error("Financial statements not found for this ticker (might be an ETF?).")
-            return None
+        try:
+            cash = bs.loc['Cash And Cash Equivalents'].iloc[0]
+        except KeyError:
+            cash = 0
+            
+        net_debt = total_debt - cash
 
-        bs = bs_data[0]
-        cf = cf_data[0]
-
-        # --- MANUAL CALCULATIONS (Bypassing Premium Endpoints) ---
-        
-        # Net Debt = (Short Term Debt + Long Term Debt) - (Cash + Equivalents)
-        # Note: FMP field names can vary, using standard safe gets
-        short_debt = bs.get('shortTermDebt', 0)
-        long_debt = bs.get('longTermDebt', 0)
-        cash = bs.get('cashAndCashEquivalents', 0)
-        net_debt_calc = (short_debt + long_debt) - cash
-        
-        # FCF = Operating Cash Flow - Capital Expenditure
-        ocf = cf.get('operatingCashFlow', 0)
-        capex = cf.get('capitalExpenditure', 0)
-        fcf_calc = ocf - capex # Note: CapEx is usually negative in statements, but FMP returns it as negative. 
-        # Standard Formula: OCF - CapEx. If FMP gives negative CapEx, we add it? 
-        # FMP 'freeCashFlow' field is usually reliable in the statement itself.
-        fcf_final = cf.get('freeCashFlow', ocf + capex) 
+        # 4. CALCULATE FCF (Operating Cash Flow - CapEx)
+        try:
+            ocf = cf.loc['Operating Cash Flow'].iloc[0]
+            # CapEx is usually negative in Yahoo, so we ADD it to subtract the value
+            capex = cf.loc['Capital Expenditure'].iloc[0] 
+            fcf = ocf + capex
+        except KeyError:
+            # Fallback to Free Cash Flow field if manual calc fails
+            fcf = cf.loc['Free Cash Flow'].iloc[0] if 'Free Cash Flow' in cf.index else 0
 
         return {
-            "price": quote.get('price', 0),
-            "name": quote.get('name', ticker),
-            "image": f"https://financialmodelingprep.com/image-stock/{ticker}.png", # Construct image URL manually to save a call
-            "description": "Description unavailable in free mode", # Profile endpoint is often legacy now
-            "shares_out": quote.get('sharesOutstanding', 0),
-            "net_debt": net_debt_calc, # Total Net Debt (not per share)
-            "fcf": fcf_final,
-            "beta": 0 # Beta is often in profile (legacy), setting to 0 or manual input
+            "price": price,
+            "name": name,
+            "image": info.get('logo_url', ''), # Yahoo often doesn't send logos, so this might be blank
+            "description": info.get('longBusinessSummary', 'No description'),
+            "shares_out": shares,
+            "net_debt": net_debt,
+            "fcf": fcf,
+            "beta": info.get('beta', 1.0)
         }
 
     except Exception as e:
-        st.error(f"Data Parse Error: {str(e)}")
+        st.error(f"Error fetching data: {str(e)}")
         return None
 
 # --- 2. DCF LOGIC ---
@@ -106,13 +93,13 @@ def calculate_dcf(fcf, growth_rate, wacc, terminal_growth, shares, net_debt):
     return equity_value / shares
 
 # --- 3. UI LAYOUT ---
-st.title("📊 Intelligent DCF Modeler")
+st.title("📊 Intelligent DCF Modeler (Powered by Yahoo)")
 
 with st.sidebar:
     st.header("Settings")
     ticker = st.text_input("Ticker Symbol", "AAPL").upper()
     if st.button("Analyze Stock"):
-        with st.spinner('Fetching financial statements...'):
+        with st.spinner(f'Pulling data for {ticker}...'):
             data = get_company_data(ticker)
             if data:
                 st.session_state['data'] = data
@@ -121,11 +108,8 @@ if 'data' in st.session_state:
     data = st.session_state['data']
     
     # Header
-    c1, c2 = st.columns([1, 4])
-    with c1: st.image(data['image'], width=80)
-    with c2: 
-        st.subheader(f"{data['name']} ({ticker})")
-        st.metric("Current Price", f"${data['price']}")
+    st.subheader(f"{data['name']} ({ticker})")
+    st.metric("Current Price", f"${data['price']}")
 
     st.markdown("---")
     
@@ -163,7 +147,6 @@ if 'data' in st.session_state:
     st.markdown("### 🎯 Valuation Targets")
     o1, o2, o3 = st.columns(3)
     
-    # Avoid div/0 if price is 0
     safe_price = data['price'] if data['price'] > 0 else 1
     
     o1.metric("Bear Target", f"${bear_p:.2f}", f"{((bear_p-safe_price)/safe_price)*100:.1f}%")
